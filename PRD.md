@@ -1,6 +1,6 @@
 # Product Requirements Document — TeemTalk
 
-**Status:** Draft v0.3 (MVP scope locked — decisions + validated integrations) · **Last updated:** June 19, 2026 · **Owner:** _TBD_
+**Status:** Draft v0.3 (MVP scope locked — decisions + validated integrations) · **Last updated:** June 19, 2026 · **Owner:** TeemTalk
 
 ---
 
@@ -190,8 +190,8 @@ The schedule of record sits behind a **`ScheduleProvider` abstraction** so the s
 
 **Tech stack (MVP):**
 
-| Layer              | Choice                                                                                                  |
-| ------------------ | ------------------------------------------------------------------------------------------------------- |
+| Layer              | Choice                                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------- |
 | Language           | TypeScript end-to-end                                                                                    |
 | Voice              | Vapi — inbound intake + outbound dispatch; owns STT / TTS                                                |
 | LLM brain          | Nebius AI Studio (open model) via Vapi `custom-llm` (OpenAI-compatible, SSE streaming)                   |
@@ -254,12 +254,12 @@ Employee and Shift data may be sourced from Square; LeaveRequest, CoverageTask, 
 
 | Phase    | Adds                                                                                                                   |
 | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **V1.1** | SMS channel — reply-to-accept, confirmations, fallback for no-answers |
-| **V1.2** | Approval-required leave types — manager pre-approval step + SLA before coverage begins |
-| **V1.3** | Identity hardening — spoken-PIN (or SMS-code) second factor before any shift change |
-| **V1.4** | Time / urgency awareness — last-minute vs. advance routing, quiet hours, hard escalation cutoff |
-| **V1.5** | Parallel outbound with safe claim; partial / split-shift coverage; incentive offers |
-| **V1.6** | Advanced eligibility (rest gaps, overtime optimization); richer minimum-staffing rules |
+| **V1.1** | SMS channel — reply-to-accept, confirmations, fallback for no-answers                                                  |
+| **V1.2** | Approval-required leave types — manager pre-approval step + SLA before coverage begins                                 |
+| **V1.3** | Identity hardening — spoken-PIN (or SMS-code) second factor before any shift change                                    |
+| **V1.4** | Time / urgency awareness — last-minute vs. advance routing, quiet hours, hard escalation cutoff                        |
+| **V1.5** | Parallel outbound with safe claim; partial / split-shift coverage; incentive offers                                    |
+| **V1.6** | Advanced eligibility (rest gaps, overtime optimization); richer minimum-staffing rules                                 |
 | **V2**   | Additional scheduling connectors (7shifts, Deputy, When I Work); multi-location / time zones                           |
 | **V2+**  | Compliance automation (predictive scheduling, minor-hour limits, recording consent); "yes-then-no-show" accountability |
 
