@@ -1,6 +1,6 @@
 # Product Requirements Document — Teem.Talk
 
-**Status:** Draft v0.1 (MVP scope) · **Last updated:** June 19, 2026 · **Owner:** _TBD_
+**Status:** Draft v0.2 (MVP scope + tech stack) · **Last updated:** June 19, 2026 · **Owner:** _TBD_
 
 ---
 
@@ -163,10 +163,10 @@ Eligibility is computed by a backend service — an edge function exposed to the
 
 ## 9. Non-Functional Requirements
 
-- **Latency** — voice turns must feel responsive; eligibility tool calls must return fast enough to avoid dead air (target < ~1–2s).
+- **Latency** — voice turns must feel responsive; eligibility tool calls must return fast enough to avoid dead air (target < ~1–2s). The Nebius `custom-llm` brain must stream tokens (SSE) and run on a "fast"-tier model so the added LLM hop stays within budget.
 - **Reliability & idempotency** — a dropped call mid-update must not corrupt state; all schedule writes are idempotent and recoverable.
 - **Concurrency** — shift assignment is the critical section; a single winner is guaranteed via the transactional claim/constraint.
-- **Security** — protect API tokens (Vapi, Square) and PII; least-privilege scopes; no secrets in prompts.
+- **Security** — protect API tokens (Vapi, Nebius, Square) and PII; least-privilege scopes; store keys in InsForge secrets (server-only), never in prompts or frontend env.
 - **Privacy** — leave reasons (which may include medical context) are access-restricted and never broadcast to staff.
 - **Observability** — structured logs for every call, decision, and schedule mutation, surfaced for diagnostics and audit.
 - **Rate limits** — handle Square API limits and Vapi constraints gracefully (backoff/retry).
@@ -184,12 +184,34 @@ Four logical roles, coordinated by an orchestrator that owns workflow state:
 - **Coverage agent (outbound, Vapi)** — runs the sequential call-down and accept/decline handling.
 - **Escalation + Notifier** — manager calls and confirmations to all parties.
 
-Eligibility and leave-routing live as **edge functions** on the backend, exposed to the Vapi agents as tools. The schedule is read/written through the **Square Labor API**; the internal store holds workflow/audit state and syncs via Square webhooks.
+Eligibility and leave-routing live as **InsForge edge functions** (Deno / TypeScript), exposed to the Vapi agents as tools. A single `vapi-webhook` edge function multiplexes all inbound Vapi traffic — tool calls, status updates, and end-of-call reports — behind a lightweight [Hono](https://hono.dev) router that handles routing, signature verification, and schema validation. (Hono is used as a library _inside_ the edge function, not as a separate service.) The call-down is **event-driven**: each Vapi end-of-call report advances the coverage task — next candidate, claim, or escalate — backed by a **pg_cron** safety sweep that re-drives tasks stuck on timeouts or no-answers.
+
+The agents' LLM "brain" runs on **Nebius AI Studio** via Vapi's `custom-llm` integration — an OpenAI-compatible endpoint serving a fast, function-calling-capable open model. Vapi still owns speech-to-text and text-to-speech; only the reasoning / tool-calling step is routed to Nebius.
+
+The schedule of record sits behind a **`ScheduleProvider` abstraction** so the system is never hard-wired to one vendor. The MVP ships a `LocalScheduleProvider` (the InsForge `Shift` table is the source of truth), so the full voice + coverage loop can be built and demoed without Square. A `SquareScheduleProvider` (Labor API create→update→publish + webhook reconciliation) drops in behind the same interface once Square sandbox access lands. The internal store holds workflow / audit state regardless of provider.
+
+**Tech stack (MVP):**
+
+| Layer              | Choice                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------- |
+| Language           | TypeScript end-to-end                                                                                    |
+| Voice              | Vapi — inbound intake + outbound dispatch; owns STT / TTS                                                |
+| LLM brain          | Nebius AI Studio (open model) via Vapi `custom-llm` (OpenAI-compatible, SSE streaming)                   |
+| Backend logic      | InsForge edge functions (Deno); Hono router inside the `vapi-webhook` function                           |
+| Data / state       | InsForge Postgres + RLS; transactional claim via `SECURITY DEFINER` SQL function + uniqueness constraint |
+| Async dispatch     | Event-driven (Vapi end-of-call webhooks) + pg_cron safety sweep                                          |
+| Manager dashboard  | Vite + React, InsForge realtime, hosted via InsForge deployments                                         |
+| Schedule of record | `ScheduleProvider` — `Local` (MVP) → `Square` Labor API (when sandbox access lands)                      |
+| Repo layout        | Single-workspace monorepo: `dashboard/`, `functions/`, `db/migrations/`, `shared/`                       |
 
 ```
-Employee ──call──▶ Vapi (Intake) ──tools──▶ InsForge (state + eligibility) ◀──sync──▶ Square (schedule of record)
-                                     │
-                                     └── enqueue ──▶ Coverage task ──▶ Vapi (Dispatch) ──calls──▶ Teammates → Manager
+LLM brain   Nebius AI Studio ◀──custom-llm── Vapi (Intake / Dispatch)
+Voice       Employee ──call──▶ Vapi (Intake / Dispatch) ──outbound calls──▶ Teammates → Manager
+Backend     Vapi ──tools + webhooks (Hono)──▶ InsForge edge functions ──▶ Coverage task ──▶ Vapi (Dispatch)
+State       InsForge Postgres (state · eligibility · claim · audit)
+Schedule    ScheduleProvider ──┬─ Local: InsForge Shift table        (MVP)
+                               └─ Square Labor API                   (when sandbox access lands)
+Dashboard   InsForge realtime ──▶ Manager dashboard (Vite / React)
 ```
 
 ---
@@ -211,9 +233,10 @@ Employee and Shift data may be sourced from Square; LeaveRequest, CoverageTask, 
 
 ## 12. Integrations
 
-- **Vapi** — inbound + outbound voice. Agent tools call backend HTTP endpoints (eligibility, claim, schedule update). A transfer-to-human path is reserved.
-- **Square Labor API (Sandbox for MVP)** — scheduled shifts via the create → update → publish flow, plus webhooks for shift/time-off events. The sandbox is free for build and validation; production requires the seller's qualifying Square plan.
-- **InsForge** — Postgres data store, edge functions for eligibility and leave-routing, realtime for the manager view; serves as the workflow/audit layer behind the agents.
+- **Vapi** — inbound + outbound voice (owns STT / TTS). Agent tools call backend HTTP endpoints (eligibility, claim, schedule update); the LLM step is delegated to Nebius via `custom-llm`. A transfer-to-human path is reserved.
+- **Nebius AI Studio** — the agents' LLM, reached through Vapi's `custom-llm` (OpenAI-compatible) integration; a fast, function-calling-capable open model handles reasoning and tool-calling. Keeps token spend on Nebius and the model swappable.
+- **Square Labor API (Sandbox, when available)** — accessed _only_ through the `ScheduleProvider` abstraction (see §10), so it is not a hard build dependency. When connected: scheduled shifts via the create → update → publish flow, plus webhooks for shift/time-off events. The sandbox is free for build and validation; production requires the seller's qualifying Square plan. Until access lands, the MVP runs on `LocalScheduleProvider`.
+- **InsForge** — Postgres data store, edge functions (Deno / TypeScript) hosting the Vapi tools and webhook handler, realtime powering the manager dashboard, and pg_cron for the coverage-task safety sweep; serves as the workflow/audit layer behind the agents. The manager dashboard (Vite / React) is hosted via InsForge deployments.
 
 ---
 
@@ -249,7 +272,7 @@ Employee and Shift data may be sourced from Square; LeaveRequest, CoverageTask, 
 - **Square production plan** — confirm which Square plan exposes scheduling for real sellers, and the cost implication for customers.
 - **Voicemail semantics** — does reaching voicemail count as a decline immediately, or after a callback window?
 - **Identity edge** — the policy for shared/changed numbers before the manual-override hook exists.
-- **Risk — single-integration dependence.** Tying the MVP to Square limits which businesses can adopt until connectors expand.
+- **Risk — single-integration dependence (mitigated).** Rather than hard-wiring to Square, the schedule of record sits behind a `ScheduleProvider` interface (§10): the MVP builds and demos on `LocalScheduleProvider`, and Square (or future connectors) drop in behind the same interface. This removes Square as a build blocker and shrinks the cost of adding connectors later.
 - **Risk — voice comprehension failures** could strand a request. The transfer-to-human path should ship early, even if minimal.
 
 ---
