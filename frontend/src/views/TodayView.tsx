@@ -27,117 +27,78 @@ export function TodayView() {
         <div className="col-stack">
           <CoverageHeroCard />
 
-          <div className="card" style={{ padding: '18px 20px 22px' }}>
+          <div className="card" style={{ padding: '18px 20px 24px' }}>
             <div className="card-title" style={{ marginBottom: 18 }}>
               Today&apos;s floor
             </div>
-            <div style={{ position: 'relative', height: 150 }}>
-              {d.todayRows.map((r) => (
-                <div
-                  key={r.label}
-                  style={{
-                    position: 'absolute',
-                    left: 0,
-                    right: 0,
-                    height: 30,
-                    top: r.top,
-                  }}
-                >
-                  <div
+            <div className="floor-timeline">
+              <div className="floor-timeline-rows">
+                {d.todayRows.map((r, i) => {
+                  const barWidth = parseFloat(r.width)
+                  const showName = barWidth >= 20
+
+                  return (
+                    <div className="floor-timeline-row" key={`${r.label}-${r.initials}-${i}`}>
+                      <span className="floor-timeline-label">{r.label}</span>
+                      <div className="floor-timeline-track">
+                        <div
+                          className="floor-timeline-bar"
+                          style={{
+                            left: r.left,
+                            width: r.width,
+                            background: r.bg,
+                            border: `1px solid ${r.border}`,
+                          }}
+                        >
+                          <span
+                            className="avatar"
+                            style={{
+                              width: 18,
+                              height: 18,
+                              background: r.tint,
+                              color: r.tintText,
+                              fontSize: 9.5,
+                            }}
+                          >
+                            {r.initials}
+                          </span>
+                          {showName ? (
+                            <span className="floor-timeline-bar-name" style={{ color: r.textColor }}>
+                              {r.who}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+              <div className="floor-timeline-axis">
+                {[
+                  ['0%', '6a', 'start'],
+                  ['19%', '9a', 'center'],
+                  ['38%', '12p', 'center'],
+                  ['56%', '3p', 'center'],
+                  ['75%', '6p', 'center'],
+                  ['94%', '9p', 'end'],
+                ].map(([left, label, align]) => (
+                  <span
+                    key={label}
+                    className="floor-timeline-tick"
                     style={{
-                      position: 'absolute',
-                      left: 0,
-                      top: 9,
-                      width: 64,
-                      fontSize: 11.5,
-                      fontWeight: 600,
-                      color: '#8C8175',
+                      left,
+                      transform:
+                        align === 'start'
+                          ? 'none'
+                          : align === 'end'
+                            ? 'translateX(-100%)'
+                            : 'translateX(-50%)',
                     }}
                   >
-                    {r.label}
-                  </div>
-                  <div style={{ position: 'absolute', left: 74, right: 0, top: 0, bottom: 0 }}>
-                    <div
-                      style={{
-                        position: 'absolute',
-                        top: 0,
-                        bottom: 0,
-                        left: r.left,
-                        width: r.width,
-                        background: r.bg,
-                        border: `1px solid ${r.border}`,
-                        borderRadius: 9,
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 7,
-                        padding: '0 10px',
-                        overflow: 'hidden',
-                      }}
-                    >
-                      <span
-                        className="avatar"
-                        style={{
-                          width: 18,
-                          height: 18,
-                          background: r.tint,
-                          color: r.tintText,
-                          fontSize: 9.5,
-                        }}
-                      >
-                        {r.initials}
-                      </span>
-                      <span
-                        style={{
-                          fontSize: 11.5,
-                          fontWeight: 600,
-                          color: r.textColor,
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                        }}
-                      >
-                        {r.who}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div
-              style={{
-                position: 'relative',
-                height: 22,
-                marginLeft: 74,
-                borderTop: '1px solid #EADFCD',
-                marginTop: 12,
-                paddingTop: 6,
-              }}
-            >
-              {[
-                ['0%', '6a'],
-                ['19%', '9a'],
-                ['38%', '12p'],
-                ['56%', '3p'],
-                ['75%', '6p'],
-                ['94%', '9p'],
-              ].map(([left, label], i, labels) => (
-                <span
-                  key={label}
-                  style={{
-                    position: 'absolute',
-                    left,
-                    top: 6,
-                    transform:
-                      i === 0 ? 'none' : i === labels.length - 1 ? 'translateX(-100%)' : 'translateX(-50%)',
-                    fontFamily: "'Space Mono', monospace",
-                    fontSize: 10.5,
-                    color: '#A89C8A',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {label}
-                </span>
-              ))}
+                    {label}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
         </div>
