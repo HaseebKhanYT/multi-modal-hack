@@ -1,18 +1,18 @@
-# Product Requirements Document — Teem.Talk
+# Product Requirements Document — TeemTalk
 
-**Status:** Draft v0.2 (MVP scope + tech stack) · **Last updated:** June 19, 2026 · **Owner:** _TBD_
+**Status:** Draft v0.3 (MVP scope locked — decisions + validated integrations) · **Last updated:** June 19, 2026 · **Owner:** _TBD_
 
 ---
 
 ## 1. Summary
 
-Teem.Talk is a voice-first agent that automates shift leave requests and last-minute coverage for small, shift-based teams — cafés, restaurants, security details, and similar small businesses. When a scheduled employee needs time off, they call the agent. It captures the request, updates the schedule, and then autonomously calls eligible teammates one at a time until the shift is covered, escalating to the manager only if no one is available. The goal is to take the manual burden of leave handling and shift backfilling off owners and managers entirely for routine cases.
+TeemTalk is a voice-first agent that automates shift leave requests and last-minute coverage for small, shift-based teams — cafés, restaurants, security details, and similar small businesses. When a scheduled employee needs time off, they call the agent. It captures the request, updates the schedule, and then autonomously calls eligible teammates one at a time until the shift is covered, escalating to the manager only if no one is available. The goal is to take the manual burden of leave handling and shift backfilling off owners and managers entirely for routine cases.
 
 ---
 
 ## 2. Problem
 
-Small shift-based businesses run lean, and when an employee calls out, backfilling the shift falls on a single owner or manager — usually by phone or text, often at inconvenient hours. The process is reactive, error-prone, and time-consuming: chasing replacements one by one, negotiating who can cover, and manually patching the schedule. Existing scheduling tools store the schedule and may notify staff of changes, but they don't _do the calling and negotiating_ needed to actually fill a gap. Teem.Talk closes that gap by handling the conversation and the coordination, not just the data.
+Small shift-based businesses run lean, and when an employee calls out, backfilling the shift falls on a single owner or manager — usually by phone or text, often at inconvenient hours. The process is reactive, error-prone, and time-consuming: chasing replacements one by one, negotiating who can cover, and manually patching the schedule. Existing scheduling tools store the schedule and may notify staff of changes, but they don't _do the calling and negotiating_ needed to actually fill a gap. TeemTalk closes that gap by handling the conversation and the coordination, not just the data.
 
 ---
 
@@ -34,6 +34,8 @@ Small shift-based businesses run lean, and when an employee calls out, backfilli
 - Partial / split-shift coverage and incentive offers.
 - Scheduling connectors beyond Square.
 - Automated labor-law / predictive-scheduling compliance.
+- Approval-required (manager pre-approval) leave — MVP handles **notification-type leave only** (sick / emergency / personal release immediately); approval-required types (e.g. planned / vacation) are deferred to the Roadmap.
+- Caller second-factor auth (spoken PIN / SMS) — MVP verifies identity by **caller-ID match only** (accepted risk; see §15).
 
 ---
 
@@ -75,7 +77,7 @@ Small shift-based businesses run lean, and when an employee calls out, backfilli
 
 1. **Inbound (Intake agent).** The caller's phone number is matched to a known employee. Unknown numbers are sent to voicemail and granted no scheduling actions.
 2. The agent confirms the caller's upcoming shift, captures the **leave type**, and records the reason (kept private).
-3. If the leave type **requires approval**, the request is routed to the manager for approval _before_ any coverage begins. Otherwise (notification-type leave such as sick/emergency), the shift is released immediately.
+3. The shift is **released immediately** — the MVP supports notification-type leave only (sick / emergency / personal). Approval-required leave is deferred to the Roadmap.
 4. The released shift is written to the schedule, and a **coverage task** is enqueued (asynchronous handoff — the caller is not held on the line during the call-down).
 5. **Dispatch (Coverage agent)** pulls the task, asks the eligibility service for a ranked list of eligible teammates, and calls them **one at a time**.
 6. On the first "yes," the shift is **claimed** (transactional lock) and assigned; remaining candidates are skipped. Declines, no-answers, and voicemails advance to the next candidate after a timeout.
@@ -87,11 +89,7 @@ flowchart TD
   A[Inbound call] --> B{Caller ID known?}
   B -- No --> V[Voicemail / access denied]
   B -- Yes --> C[Capture leave type + reason]
-  C --> D{Approval required?}
-  D -- Yes --> M1[Route to manager for approval]
-  M1 -- Approved --> E[Release shift + enqueue coverage task]
-  M1 -- Denied --> Z1[Notify employee, no change]
-  D -- No --> E
+  C --> E[Release shift + enqueue coverage task]
   E --> F[Eligibility service: ranked candidates]
   F --> G[Call next candidate]
   G --> H{Accepted?}
@@ -110,7 +108,7 @@ flowchart TD
 
 ### 8.1 Identity & Access
 
-- **FR-1** Match the inbound caller's phone number against the employee roster; only known, active employees proceed.
+- **FR-1** Match the inbound caller's phone number against the employee roster; only known, active employees proceed. **MVP uses caller-ID matching as the sole identity factor** (no PIN / second factor — accepted risk, §15).
 - **FR-2** Unknown or unmatched numbers are routed to voicemail and denied all scheduling actions.
 - **FR-3** Provide a manual-override hook for future handling of shared/changed numbers (not auto-enabled in MVP).
 
@@ -118,7 +116,7 @@ flowchart TD
 
 - **FR-4** Capture the leave type (e.g. sick, emergency, personal, planned/vacation).
 - **FR-5** Record a free-form reason, stored privately and never disclosed to other staff.
-- **FR-6** Branch on leave type: approval-required types pause for manager approval; notification types release the shift immediately.
+- **FR-6** Release the shift immediately for all MVP-supported (notification-type) leave — sick, emergency, personal. Approval-required leave (manager pre-approval + SLA) is deferred to the Roadmap; the data model keeps `approval_status` for forward-compatibility.
 - **FR-7** Confirm the specific shift being vacated before making any change.
 
 ### 8.3 Eligibility Engine (server-side)
@@ -129,7 +127,7 @@ Eligibility is computed by a backend service — an edge function exposed to the
 - **FR-9** The candidate must hold the role/certification the shift requires.
 - **FR-10** The candidate must not be on their own approved leave.
 - **FR-11** MVP includes basic hours awareness (don't exceed a configured max); advanced rest-gap ("clopening") rules and overtime-cost optimization are configurable extensions (post-MVP).
-- **FR-12** The engine returns a **ranked** candidate list per a configurable policy (default order TBD — see Open Questions).
+- **FR-12** The engine returns a **ranked** candidate list. **Default policy: round-robin / fairness** — coverage offers are distributed evenly across eligible staff so the same person isn't always called first. The policy is configurable; seniority, volunteer-first, and lowest-overtime are post-MVP options.
 
 ### 8.4 Coverage Dispatch
 
@@ -179,7 +177,7 @@ Eligibility is computed by a backend service — an edge function exposed to the
 
 Four logical roles, coordinated by an orchestrator that owns workflow state:
 
-- **Intake agent (inbound, Vapi)** — identity, leave capture, approval branch.
+- **Intake agent (inbound, Vapi)** — identity (caller-ID match), leave capture, immediate shift release.
 - **Orchestrator / state layer (InsForge)** — owns coverage tasks, ranking inputs, locking, and escalation decisions; hands off to dispatch asynchronously via a task queue.
 - **Coverage agent (outbound, Vapi)** — runs the sequential call-down and accept/decline handling.
 - **Escalation + Notifier** — manager calls and confirmations to all parties.
@@ -233,9 +231,9 @@ Employee and Shift data may be sourced from Square; LeaveRequest, CoverageTask, 
 
 ## 12. Integrations
 
-- **Vapi** — inbound + outbound voice (owns STT / TTS). Agent tools call backend HTTP endpoints (eligibility, claim, schedule update); the LLM step is delegated to Nebius via `custom-llm`. A transfer-to-human path is reserved.
-- **Nebius AI Studio** — the agents' LLM, reached through Vapi's `custom-llm` (OpenAI-compatible) integration; a fast, function-calling-capable open model handles reasoning and tool-calling. Keeps token spend on Nebius and the model swappable.
-- **Square Labor API (Sandbox, when available)** — accessed _only_ through the `ScheduleProvider` abstraction (see §10), so it is not a hard build dependency. When connected: scheduled shifts via the create → update → publish flow, plus webhooks for shift/time-off events. The sandbox is free for build and validation; production requires the seller's qualifying Square plan. Until access lands, the MVP runs on `LocalScheduleProvider`.
+- **Vapi** — inbound + outbound voice (owns STT / TTS). Agent tools call backend HTTP endpoints (eligibility, claim, schedule update); the LLM step is delegated to Nebius via `custom-llm`. A transfer-to-human path is reserved. _Validated 2026-06-19:_ the tool-call contract (`message.toolCallList[]` → `{ results: [{ toolCallId, result }] }`) works end-to-end against an InsForge edge function on a live call.
+- **Nebius AI Studio** — the agents' LLM, reached through Vapi's `custom-llm` (OpenAI-compatible) integration; a fast, function-calling-capable open model handles reasoning and tool-calling. Keeps token spend on Nebius and the model swappable. _Validated 2026-06-19:_ `meta-llama/Llama-3.3-70B-Instruct` at `https://api.studio.nebius.ai/v1` (direct, authenticated via a Vapi custom-llm credential) reliably emits tool calls from natural speech.
+- **Square Labor API (Sandbox — validated)** — accessed _only_ through the `ScheduleProvider` abstraction (see §10), so it is not a hard build dependency. _Validated 2026-06-19:_ the **Scheduled Shifts** API supports the full create → update → publish flow (delete = update with `is_deleted` then publish), and `labor.scheduled_shift.created/updated/published/deleted` webhooks back the reconciliation path (FR-23). Pin `Square-Version 2025-05-21`; required scope `TIMECARDS_WRITE`. Sandbox is free for build/validation; production still requires the seller's qualifying Square plan (see §15). The MVP develops on `LocalScheduleProvider` and swaps in `SquareScheduleProvider` behind the same interface.
 - **InsForge** — Postgres data store, edge functions (Deno / TypeScript) hosting the Vapi tools and webhook handler, realtime powering the manager dashboard, and pg_cron for the coverage-task safety sweep; serves as the workflow/audit layer behind the agents. The manager dashboard (Vite / React) is hosted via InsForge deployments.
 
 ---
@@ -256,10 +254,12 @@ Employee and Shift data may be sourced from Square; LeaveRequest, CoverageTask, 
 
 | Phase    | Adds                                                                                                                   |
 | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **V1.1** | SMS channel — reply-to-accept, confirmations, fallback for no-answers                                                  |
-| **V1.2** | Time / urgency awareness — last-minute vs. advance routing, quiet hours, hard escalation cutoff                        |
-| **V1.3** | Parallel outbound with safe claim; partial / split-shift coverage; incentive offers                                    |
-| **V1.4** | Advanced eligibility (rest gaps, overtime optimization); richer minimum-staffing rules                                 |
+| **V1.1** | SMS channel — reply-to-accept, confirmations, fallback for no-answers |
+| **V1.2** | Approval-required leave types — manager pre-approval step + SLA before coverage begins |
+| **V1.3** | Identity hardening — spoken-PIN (or SMS-code) second factor before any shift change |
+| **V1.4** | Time / urgency awareness — last-minute vs. advance routing, quiet hours, hard escalation cutoff |
+| **V1.5** | Parallel outbound with safe claim; partial / split-shift coverage; incentive offers |
+| **V1.6** | Advanced eligibility (rest gaps, overtime optimization); richer minimum-staffing rules |
 | **V2**   | Additional scheduling connectors (7shifts, Deputy, When I Work); multi-location / time zones                           |
 | **V2+**  | Compliance automation (predictive scheduling, minor-hour limits, recording consent); "yes-then-no-show" accountability |
 
@@ -267,11 +267,11 @@ Employee and Shift data may be sourced from Square; LeaveRequest, CoverageTask, 
 
 ## 15. Open Questions & Risks
 
-- **Candidate ranking policy** — seniority, fairness/round-robin, volunteer-first, or lowest-overtime? Needs a decision; directly affects perceived fairness among staff.
-- **Approval-required leave types** — the exact list, and the approval SLA before coverage proceeds.
+- **Candidate ranking policy** — _resolved:_ MVP defaults to **round-robin / fairness** (FR-12); seniority, volunteer-first, and lowest-overtime remain configurable, post-MVP.
+- **Approval-required leave** — _resolved:_ **out of MVP scope** (notification-type leave only); the approval flow is tracked in Roadmap V1.2.
 - **Square production plan** — confirm which Square plan exposes scheduling for real sellers, and the cost implication for customers.
 - **Voicemail semantics** — does reaching voicemail count as a decline immediately, or after a callback window?
-- **Identity edge** — the policy for shared/changed numbers before the manual-override hook exists.
+- **Risk — caller-ID-only identity (accepted for MVP).** Identity is verified by matching the inbound number only, so a spoofed or borrowed phone could release someone's shift; shared / changed numbers also need a manual-override hook. Accepted for MVP scope; a spoken-PIN second factor is the planned hardening (Roadmap V1.3).
 - **Risk — single-integration dependence (mitigated).** Rather than hard-wiring to Square, the schedule of record sits behind a `ScheduleProvider` interface (§10): the MVP builds and demos on `LocalScheduleProvider`, and Square (or future connectors) drop in behind the same interface. This removes Square as a build blocker and shrinks the cost of adding connectors later.
 - **Risk — voice comprehension failures** could strand a request. The transfer-to-human path should ship early, even if minimal.
 
