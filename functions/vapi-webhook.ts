@@ -15,7 +15,13 @@
 //   Outbound dispatch (agent calls teammates):
 //     - find_coverage_candidates(shift_id)              -> ranked eligible peers + escalation outcome
 //     - record_coverage_response(shift_id, employee_name, accepted)
-//                                                        -> assign on accept, advance the queue on decline
+//                                                        -> assign + close on accept; log on decline
+//
+// Outbound call-down: create_leave_request places the first coverage call; the queue then
+// advances one teammate at a time, driven by Vapi 'end-of-call-report' webhooks (with a
+// pg_cron safety sweep as backstop), until someone accepts, the manager is reached, or the
+// shift is flagged uncovered. Real dials are gated on VAPI_PHONE_NUMBER_ID (else 'simulated').
+// Also handles { action: 'sweep' } (cron) and acks other Vapi server messages.
 //
 // Eligibility (FR-8/9/10/11/12/17): role/cert match, no double-booking, hours cap,
 // requester excluded, peers ranked by fewest scheduled hours, managers only as a
@@ -26,6 +32,13 @@ import { createAdminClient } from 'npm:@insforge/sdk';
 const BASE_URL = Deno.env.get('INSFORGE_BASE_URL') ?? 'https://smsfb7r9.us-east.insforge.app';
 const API_KEY = Deno.env.get('API_KEY') ?? '';
 const VAPI_SERVER_SECRET = Deno.env.get('VAPI_SERVER_SECRET') ?? '';
+
+// Outbound dispatch config. Real calls are placed only when VAPI_PHONE_NUMBER_ID is set;
+// without it the loop still runs but dials are recorded as 'simulated' (testable, no telephony).
+const VAPI_API_KEY = Deno.env.get('VAPI_API_KEY') ?? '';
+const VAPI_PHONE_NUMBER_ID = Deno.env.get('VAPI_PHONE_NUMBER_ID') ?? '';
+const COVERAGE_ASSISTANT_ID = Deno.env.get('COVERAGE_ASSISTANT_ID') ?? 'e1e64548-df56-4bf6-bd87-39f0a5e63dea';
+const STALE_CALL_MS = 90_000; // sweep advances pending tasks whose call has run longer than this
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -172,6 +185,132 @@ function computeEligibility(shift: Shift, requesterId: string | null, employees:
 }
 
 // ---------------------------------------------------------------------------
+// Outbound dispatch loop
+// ---------------------------------------------------------------------------
+
+const shiftTimeLabel = (s: Shift) => `${s.start_time.slice(0, 5)}–${s.end_time.slice(0, 5)}`;
+
+interface CoverageTask {
+  id: string;
+  shift_id: string;
+  status: string;
+  candidate_queue: string[];
+  current_candidate: string | null;
+  attempts: number;
+  escalation_status: string | null;
+  current_call_id: string | null;
+}
+
+// Place (or simulate) one outbound coverage call to `candidate`, and record it on the task.
+// Returns the call id now tracked on the task. Telephony is gated on VAPI_PHONE_NUMBER_ID;
+// without it (or on failure) a synthetic id is used so the loop stays drivable by the sweep.
+async function placeCoverageCall(task: CoverageTask, shift: Shift, candidate: Employee): Promise<{ callId: string; outcome: string }> {
+  const variableValues = {
+    employee_first_name: firstName(candidate.name),
+    shift_id: shift.id,
+    shift_role: shift.role_required,
+    shift_date: shift.shift_date,
+    shift_time: shiftTimeLabel(shift),
+  };
+
+  let callId: string | null = null;
+  let outcome = 'calling';
+  if (VAPI_PHONE_NUMBER_ID && VAPI_API_KEY && candidate.phone_digits) {
+    try {
+      const res = await fetch('https://api.vapi.ai/call', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${VAPI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          assistantId: COVERAGE_ASSISTANT_ID,
+          phoneNumberId: VAPI_PHONE_NUMBER_ID,
+          customer: { number: `+${candidate.phone_digits}`, name: candidate.name },
+          assistantOverrides: { variableValues },
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      callId = data?.id ?? null;
+      outcome = callId ? 'calling' : 'call-failed';
+    } catch {
+      outcome = 'call-failed';
+    }
+  } else {
+    outcome = 'simulated';
+  }
+  if (!callId) callId = `${outcome}-${shift.id}-${Date.now()}`;
+
+  await admin.database.from('coverage_tasks').update({
+    current_candidate: candidate.id,
+    current_call_id: callId,
+    current_call_started_at: new Date().toISOString(),
+    attempts: (task.attempts ?? 0) + 1,
+    updated_at: new Date().toISOString(),
+  }).eq('id', task.id);
+
+  await admin.database.from('call_attempts').insert([{
+    coverage_task_id: task.id,
+    shift_id: shift.id,
+    employee_id: candidate.id,
+    vapi_call_id: callId,
+    outcome,
+  }]);
+
+  return { callId, outcome };
+}
+
+// Advance a pending task past its current (unanswered/declined) candidate to the next in the
+// queue — dialling them, or marking the task uncovered when the queue is exhausted.
+async function advanceCoverage(task: CoverageTask, shift: Shift, employees: Employee[]): Promise<{ action: string; candidate?: Employee }> {
+  const queue = task.candidate_queue ?? [];
+  const idx = task.current_candidate ? queue.indexOf(task.current_candidate) : -1;
+  const nextId = queue[idx + 1];
+  if (!nextId) {
+    await admin.database.from('coverage_tasks').update({
+      status: 'uncovered', escalation_status: 'uncovered', current_call_id: null, updated_at: new Date().toISOString(),
+    }).eq('id', task.id);
+    await admin.database.from('call_attempts').insert([{
+      coverage_task_id: task.id, shift_id: shift.id, employee_id: task.current_candidate, outcome: 'uncovered',
+    }]);
+    return { action: 'uncovered' };
+  }
+  const next = employees.find((e) => e.id === nextId)!;
+  await placeCoverageCall({ ...task }, shift, next);
+  return { action: 'called', candidate: next };
+}
+
+// Vapi end-of-call-report handler: when a coverage call ends without acceptance, move on.
+// Matches on current_call_id, so a call that already led to accept (cleared) or decline-advance
+// (replaced) is ignored — making this idempotent against duplicate/late reports.
+async function handleEndOfCall(call: Record<string, unknown>): Promise<string> {
+  const callId = call?.id as string | undefined;
+  if (!callId) return 'no call id';
+  const { data } = await admin.database.from('coverage_tasks').select('*').eq('current_call_id', callId).eq('status', 'pending').limit(1);
+  const task = (data as CoverageTask[])?.[0];
+  if (!task) return 'no pending task for this call (covered or already advanced)';
+  const shifts = await loadShifts();
+  const shift = shifts.find((s) => s.id === task.shift_id);
+  if (!shift) return 'shift not found';
+  const result = await advanceCoverage(task, shift, await loadEmployees());
+  return result.action === 'called' ? `advanced to ${result.candidate!.name}` : 'marked uncovered';
+}
+
+// pg_cron safety sweep: advance any pending task whose in-flight call has run too long
+// (a lost/never-delivered end-of-call report). Returns how many tasks were advanced.
+async function runSweep(): Promise<number> {
+  const cutoff = new Date(Date.now() - STALE_CALL_MS).toISOString();
+  const { data } = await admin.database.from('coverage_tasks')
+    .select('*').eq('status', 'pending').lt('current_call_started_at', cutoff);
+  const tasks = ((data as CoverageTask[]) ?? []).filter((t) => t.current_call_id);
+  if (tasks.length === 0) return 0;
+  const [shifts, employees] = [await loadShifts(), await loadEmployees()];
+  let advanced = 0;
+  for (const task of tasks) {
+    const shift = shifts.find((s) => s.id === task.shift_id);
+    if (shift) { await advanceCoverage(task, shift, employees); advanced++; }
+  }
+  return advanced;
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
@@ -249,22 +388,24 @@ async function createLeaveRequest(args: Record<string, unknown>, callerPhone: st
 
   // Build the coverage queue and persist the task.
   const elig = computeEligibility(shift, emp.id, employees, shifts);
-  await admin.database.from('coverage_tasks').insert([{
+  const { data: ctData } = await admin.database.from('coverage_tasks').insert([{
     shift_id: shift.id,
     leave_request_id: leaveRequest?.id ?? null,
     status: elig.queue.length === 0 ? 'uncovered' : 'pending',
     candidate_queue: elig.queue,
-    current_candidate: elig.queue[0] ?? null,
     escalation_status: elig.escalation,
-  }]);
+  }]).select();
+  const task = (Array.isArray(ctData) ? ctData[0] : ctData) as CoverageTask;
 
-  const when = `${shift.shift_date} ${shift.start_time.slice(0, 5)}–${shift.end_time.slice(0, 5)}`;
+  const when = `${shift.shift_date} ${shiftTimeLabel(shift)}`;
   const base = `Done, ${firstName(emp.name)} — ${leave_type} approved and ${shift.id} (${shift.role_required}, ${when}) released. Reference ${ref}.`;
 
   if (elig.queue.length === 0) {
     return `${base} I don't have an eligible teammate to cover it, so I'm flagging it as uncovered for your manager.`;
   }
+  // Kick off the outbound call-down to the first candidate.
   const first = employees.find((e) => e.id === elig.queue[0])!;
+  await placeCoverageCall(task, shift, first);
   if (elig.escalation === 'escalated_manager') {
     return `${base} No eligible teammate is available, so I'll reach out to your manager ${firstName(first.name)} to cover.`;
   }
@@ -301,7 +442,7 @@ async function recordCoverageResponse(args: Record<string, unknown>): Promise<st
   const { data: taskData, error: taskErr } = await admin.database
     .from('coverage_tasks').select('*').eq('shift_id', shiftId).order('created_at', { ascending: false }).limit(1);
   if (taskErr) return `Sorry, I couldn't load the coverage task: ${taskErr.message ?? 'unknown error'}.`;
-  const task = (taskData as Array<Record<string, unknown>>)?.[0];
+  const task = (taskData as CoverageTask[])?.[0];
   if (!task) return `I don't have an open coverage task for ${shiftId}.`;
 
   const employees = await loadEmployees();
@@ -309,33 +450,31 @@ async function recordCoverageResponse(args: Record<string, unknown>): Promise<st
   if (!emp) return `I couldn't match "${responder}" to anyone on the team.`;
 
   if (accepted) {
+    // Terminal: assign the shift and close the task. Clearing current_call_id stops the
+    // end-of-call handler / sweep from advancing past the person who just accepted.
     await admin.database.from('shifts').update({ status: 'covered', assigned_employee_id: emp.id }).eq('id', shiftId);
     await admin.database.from('coverage_tasks')
-      .update({ status: 'covered', current_candidate: emp.id, updated_at: new Date().toISOString() })
-      .eq('id', task.id as string);
+      .update({ status: 'covered', current_candidate: emp.id, current_call_id: null, updated_at: new Date().toISOString() })
+      .eq('id', task.id);
+    await admin.database.from('call_attempts').insert([{
+      coverage_task_id: task.id, shift_id: shiftId, employee_id: emp.id, vapi_call_id: task.current_call_id, outcome: 'accepted',
+    }]);
     return `${firstName(emp.name)} accepted — ${shiftId} is now covered and reassigned to them. Closing this out.`;
   }
 
-  // Decline: advance the queue.
-  const queue = (task.candidate_queue as string[]) ?? [];
-  const idx = queue.indexOf(emp.id);
-  const next = idx >= 0 ? queue[idx + 1] : queue[(task.attempts as number) ?? 0];
-  const attempts = ((task.attempts as number) ?? 0) + 1;
-
-  if (!next) {
-    await admin.database.from('coverage_tasks')
-      .update({ status: 'uncovered', escalation_status: 'uncovered', attempts, current_candidate: null, updated_at: new Date().toISOString() })
-      .eq('id', task.id as string);
-    return `${firstName(emp.name)} declined and there's no one left to ask. I'm flagging ${shiftId} as uncovered for the manager.`;
+  // Decline: just log it. The queue advances when this call ends (end-of-call report or
+  // the safety sweep), which keeps the call-down strictly sequential and race-free.
+  await admin.database.from('call_attempts').insert([{
+    coverage_task_id: task.id, shift_id: shiftId, employee_id: emp.id, vapi_call_id: task.current_call_id, outcome: 'declined',
+  }]);
+  const queue = task.candidate_queue ?? [];
+  const nextId = queue[queue.indexOf(emp.id) + 1];
+  if (!nextId) {
+    return `Thanks anyway, ${firstName(emp.name)} — that was the last person I could ask, so I'll flag this shift for the manager.`;
   }
-
-  const nextEmp = employees.find((e) => e.id === next)!;
-  const escalation = nextEmp.is_manager ? 'escalated_manager' : (task.escalation_status as string | null);
-  await admin.database.from('coverage_tasks')
-    .update({ current_candidate: next, attempts, escalation_status: escalation, updated_at: new Date().toISOString() })
-    .eq('id', task.id as string);
-  const lead = nextEmp.is_manager ? `Next I'll escalate to the manager ${firstName(nextEmp.name)}` : `Next I'll call ${firstName(nextEmp.name)}`;
-  return `${firstName(emp.name)} declined ${shiftId}. ${lead}.`;
+  const nextEmp = employees.find((e) => e.id === nextId)!;
+  const lead = nextEmp.is_manager ? `I'll reach out to the manager ${firstName(nextEmp.name)} next` : `I'll try ${firstName(nextEmp.name)} next`;
+  return `No problem, ${firstName(emp.name)} — thanks for letting me know. ${lead}.`;
 }
 
 async function listLeaveRequests(args: Record<string, unknown>): Promise<string> {
@@ -378,10 +517,25 @@ export default async function (req: Request): Promise<Response> {
   try { body = await req.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
 
   const message = body?.message ?? body;
+
+  // Safety sweep trigger (pg_cron / manual): advance any stalled pending coverage tasks.
+  if (body?.action === 'sweep' || message?.action === 'sweep') {
+    const swept = await runSweep();
+    return json({ swept });
+  }
+
+  // Vapi end-of-call report: the active coverage call ended — advance the call-down.
+  if (message?.type === 'end-of-call-report') {
+    const note = await handleEndOfCall(message?.call ?? {});
+    return json({ received: true, note });
+  }
+
   const toolCalls = message?.toolCallList ?? body?.toolCallList ?? [];
   const callerPhone: string | null = message?.call?.customer?.number ?? null;
 
+  // Other Vapi server messages (status-update, etc.) carry no tool calls — just acknowledge.
   if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    if (message?.type) return json({ received: true });
     return json({ error: 'No toolCallList found in request' }, 400);
   }
 
