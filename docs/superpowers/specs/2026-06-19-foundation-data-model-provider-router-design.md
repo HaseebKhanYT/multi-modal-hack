@@ -232,7 +232,7 @@ Vapi posts all traffic to one URL, so the function exposes a single `POST /` (pl
 
 ### Re-homed tools (onto new model + provider)
 
-- `create_leave_request`: resolve the employee via `message.call.customer.number` (FR-1; fall back to a provided name when no caller number), insert a `leave_requests` row with `employee_id`, `type`, `reason`. If the vacated shift is identified (e.g. by date/role for that employee), call `provider.releaseShift(shiftId)` and set `leave_requests.shift_id`. Returns the same confirmation shape as the spike. **Coverage-task enqueue is deferred.**
+- `create_leave_request`: resolve the employee via `message.call.customer.number` (FR-1; fall back to a provided name when no caller number), insert a `leave_requests` row with `employee_id`, `type`, `reason`. **Shift to release = the employee's next upcoming shift** — the earliest `shifts` row for that `assigned_employee_id` with `starts_at` in the future and status `scheduled`/`assigned`. If found, call `provider.releaseShift(shiftId)` and set `leave_requests.shift_id`; if none, log the leave without a shift link. Returns the same confirmation shape as the spike. **Coverage-task enqueue is deferred.**
 - `list_leave_requests`: query the new `leave_requests` joined to `employees` (resolve the name), most recent first.
 
 Both tools use `InsForgeShiftStore` + `LocalScheduleProvider` from `shared/` and the admin client for `employees`/`leave_requests`.
