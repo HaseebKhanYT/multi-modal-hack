@@ -190,6 +190,18 @@ function computeEligibility(shift: Shift, requesterId: string | null, employees:
 
 const shiftTimeLabel = (s: Shift) => `${s.start_time.slice(0, 5)}–${s.end_time.slice(0, 5)}`;
 
+// Voice-friendly spoken forms for the outbound call, so TTS says "Monday, June 22, 7am to 3pm"
+// instead of reading "2026-06-22" and "07:00–15:00" as raw numbers.
+const spokenDate = (iso: string) =>
+  new Date(`${iso}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' });
+const spokenClock = (t: string) => {
+  let [h, m] = t.split(':').map(Number);
+  const ap = h < 12 ? 'am' : 'pm';
+  h = h % 12 || 12;
+  return m ? `${h}:${String(m).padStart(2, '0')}${ap}` : `${h}${ap}`;
+};
+const spokenTime = (s: Shift) => `${spokenClock(s.start_time)} to ${spokenClock(s.end_time)}`;
+
 interface CoverageTask {
   id: string;
   shift_id: string;
@@ -209,8 +221,8 @@ async function placeCoverageCall(task: CoverageTask, shift: Shift, candidate: Em
     employee_first_name: firstName(candidate.name),
     shift_id: shift.id,
     shift_role: shift.role_required,
-    shift_date: shift.shift_date,
-    shift_time: shiftTimeLabel(shift),
+    shift_date: spokenDate(shift.shift_date),
+    shift_time: spokenTime(shift),
   };
 
   let callId: string | null = null;
