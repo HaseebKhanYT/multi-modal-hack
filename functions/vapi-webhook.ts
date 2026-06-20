@@ -388,7 +388,25 @@ async function createLeaveRequest(args: Record<string, unknown>, callerPhone: st
   const ref = String(leaveRequest?.id ?? '').slice(0, 8);
 
   if (!shift) {
-    return `Got it ${firstName(emp.name)} — logged a ${leave_type} request (reference ${ref}). Which shift should I release? Tell me the shift id or the date.`;
+    // The caller's actual upcoming shifts — used to steer the model back to a real shift
+    // instead of letting it guess one (which previously released the wrong day's shift).
+    const mine = shifts
+      .filter((s) => s.assigned_employee_id === emp.id && s.status === 'assigned')
+      .sort((a, b) => (a.shift_date + a.start_time).localeCompare(b.shift_date + b.start_time));
+    const mineSpoken = mine.map((s) => `${spokenDate(s.shift_date)} (${shiftTimeLabel(s)}, ${s.role_required})`).join('; ');
+
+    if (shiftDate) {
+      // A date was named but the caller has no assigned shift then. Refuse firmly and DO NOT
+      // invite substituting a different shift — name only their real shifts so they confirm.
+      const base = `${firstName(emp.name)}, you're not scheduled on ${spokenDate(shiftDate)}, so there's no shift of yours to release that day.`;
+      return mine.length
+        ? `${base} Your upcoming shifts are: ${mineSpoken}. Which of those did you mean? (Logged note, reference ${ref}.)`
+        : `${base} You have no upcoming assigned shifts on the schedule. (Logged note, reference ${ref}.)`;
+    }
+    // Neither a usable shift id nor date — ask, listing the caller's real shifts to pick from.
+    return mine.length
+      ? `Got it ${firstName(emp.name)} — logged a ${leave_type} request (reference ${ref}). Which shift should I release? Your upcoming shifts are: ${mineSpoken}.`
+      : `Got it ${firstName(emp.name)} — logged a ${leave_type} request (reference ${ref}), but I don't see any upcoming shifts assigned to you to release.`;
   }
   if (shift.assigned_employee_id !== emp.id) {
     return `That shift (${shift.id}) isn't assigned to you, ${firstName(emp.name)}, so I can't release it. Your leave note is logged (reference ${ref}).`;
